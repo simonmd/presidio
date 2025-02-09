@@ -83,22 +83,72 @@ docker-compose up -d
 
 ### redact
 
-Receives an image and color fill (optional, default is black). Redact the image PII text
-and returns a new redacted image.
+The `/redact` endpoint supports both standard images and DICOM files.
 
 ```
 POST /redact
 ```
 
-Payload:
+#### Standard Image Redaction
 
-Sent as multipart-form. Contains image file and data of the required color fill.
+Redact PII from standard image formats (PNG, JPEG, etc.).
 
-```json
-{
-  "data": "{'color_fill':'0,0,0'}"
-}
+**Request:**
+Multipart form data with image file and optional color fill.
+
+```sh
+curl -XPOST "http://localhost:3000/redact" \
+  -H "content-type: multipart/form-data" \
+  -F "image=@image.png" \
+  -F "data=\"{'color_fill':'0,0,0'}\"" > redacted.png
 ```
+
+#### DICOM Image Redaction
+
+Redact PII from DICOM files using one of three methods:
+
+1. **Direct DICOM Upload**
+   ```sh
+   curl -XPOST "http://localhost:3000/redact" \
+     -H "content-type: application/dicom" \
+     --data-binary @image.dcm > redacted.dcm
+   ```
+
+2. **Base64 Encoded DICOM**
+   ```sh
+   curl -XPOST "http://localhost:3000/redact" \
+     -H "content-type: application/json" \
+     -d '{
+       "dicom": "'$(base64 image.dcm)'",
+       "analyzer_entities": ["PERSON", "US_SSN"]
+     }' > redacted.dcm
+   ```
+
+3. **Multipart Form DICOM Upload**
+   ```sh
+   curl -XPOST "http://localhost:3000/redact" \
+     -H "content-type: multipart/form-data" \
+     -F "image=@image.dcm" \
+     -F "data=\"{'fill':'background'}\"" > redacted.dcm
+   ```
+
+**DICOM Parameters:**
+- `fill`: Redaction fill style (default: "contrast")
+  - `"contrast"`: Use contrasting color to background
+  - `"background"`: Use background color
+- `analyzer_entities`: List of specific entities to detect (optional)
+  - Example: `["PERSON", "US_SSN", "PHONE_NUMBER"]`
+
+**Response Types:**
+- Success: Returns the redacted file
+  - Standard images: Original image format
+  - DICOM: `application/dicom` content type
+- Error: JSON error message with appropriate HTTP status code
+  ```json
+  {
+    "error": "Error message description"
+  }
+  ```
 
 Result:
 

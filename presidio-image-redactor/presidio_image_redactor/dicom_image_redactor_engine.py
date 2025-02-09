@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -209,7 +210,7 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
         if verbose:
             print(f"Output written to {output_location}")
 
-        return None
+        return output_location
 
     def redact_from_directory(
         self,
@@ -306,13 +307,21 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
 
         :return: FALSE if the Photometric Interpretation is RGB.
         """
+        logger = logging.getLogger("presidio-image-redactor")
         # Check if image is grayscale using the Photometric Interpretation element
         try:
             color_scale = instance.PhotometricInterpretation
+            logger.debug(f"DICOM PhotometricInterpretation: {color_scale}")
+            samples_per_pixel = getattr(instance, 'SamplesPerPixel', 1)
+            logger.debug(f"DICOM SamplesPerPixel: {samples_per_pixel}")
+            bits_allocated = getattr(instance, 'BitsAllocated', None)
+            logger.debug(f"DICOM BitsAllocated: {bits_allocated}")
         except AttributeError:
             color_scale = None
-        is_greyscale = color_scale in ["MONOCHROME1", "MONOCHROME2"]
+            logger.warning("No PhotometricInterpretation found in DICOM")
 
+        is_greyscale = color_scale in ["MONOCHROME1", "MONOCHROME2"]
+        logger.debug(f"Image determined to be {'greyscale' if is_greyscale else 'RGB/color'}")
         return is_greyscale
 
     @staticmethod
@@ -326,6 +335,7 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
 
         :return: Rescaled DICOM pixel_array.
         """
+        logger = logging.getLogger("presidio-image-redactor")
         # Normalize contrast
         if "WindowWidth" in instance:
             if is_greyscale:
@@ -335,21 +345,38 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
         else:
             image_2d = instance.pixel_array
 
+        logger.debug(f"Image shape before processing: {image_2d.shape}")
         # Convert to float to avoid overflow or underflow losses.
         image_2d_float = image_2d.astype(float)
 
         if not is_greyscale:
-            image_2d_scaled = image_2d_float
+            # For RGB images, rescale each channel independently
+            if len(image_2d_float.shape) == 3 and image_2d_float.shape[2] == 3:
+                image_2d_scaled = np.zeros_like(image_2d_float)
+                for channel in range(3):
+                    channel_data = image_2d_float[:,:,channel]
+                    # Rescale channel between 0-255
+                    if channel_data.max() != channel_data.min():
+                        image_2d_scaled[:,:,channel] = ((channel_data - channel_data.min()) / 
+                                                       (channel_data.max() - channel_data.min()) * 255.0)
+                    else:
+                        image_2d_scaled[:,:,channel] = channel_data
+            else:
+                logger.warning(f"RGB image has unexpected shape: {image_2d_float.shape}")
+                image_2d_scaled = image_2d_float
         else:
             # Rescaling grey scale between 0-255
-            image_2d_scaled = (
-                (image_2d_float.max() - image_2d_float)
-                / (image_2d_float.max() - image_2d_float.min())
-            ) * 255.0
+            if image_2d_float.max() != image_2d_float.min():
+                image_2d_scaled = (
+                    (image_2d_float - image_2d_float.min())
+                    / (image_2d_float.max() - image_2d_float.min())
+                ) * 255.0
+            else:
+                image_2d_scaled = image_2d_float
 
         # Convert to uint
         image_2d_scaled = np.uint8(image_2d_scaled)
-
+        logger.debug(f"Image shape after processing: {image_2d_scaled.shape}")
         return image_2d_scaled
 
     @staticmethod
@@ -366,7 +393,9 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
         :param output_file_name: Name of output file (no file extension).
         :param output_dir: String path to output directory.
         """
+        logger = logging.getLogger("presidio-image-redactor")
         shape = pixel_array.shape
+        logger.debug(f"Saving pixel array with shape: {shape}")
 
         # Write the PNG file
         os.makedirs(output_dir, exist_ok=True)
@@ -375,11 +404,17 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
                 w = png.Writer(shape[1], shape[0], greyscale=True)
                 w.write(png_file, pixel_array)
         else:
-            with open(f"{output_dir}/{output_file_name}.png", "wb") as png_file:
-                w = png.Writer(shape[1], shape[0], greyscale=False)
-                # Semi-flatten the pixel array to RGB representation in 2D
-                pixel_array = np.reshape(pixel_array, (shape[0], shape[1] * 3))
-                w.write(png_file, pixel_array)
+            # For RGB images, we need to separate the channels
+            if len(shape) == 3 and shape[2] == 3:
+                # Convert from (height, width, channels) to (height, width*channels)
+                rgb_array = np.reshape(pixel_array, (shape[0], -1))
+                with open(f"{output_dir}/{output_file_name}.png", "wb") as png_file:
+                    w = png.Writer(shape[1], shape[0], greyscale=False)
+                    w.write(png_file, rgb_array)
+            else:
+                logger.error(f"Invalid RGB image shape: {shape}")
+                raise ValueError(f"RGB image must have shape (height, width, 3), got {shape}")
+
 
         return None
 
@@ -499,26 +534,51 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
 
         :return: Most or least common pixel value (depending on fill).
         """
-        # Crop down to just only look at image corners
-        cropped_array = cls._get_array_corners(instance.pixel_array, crop_ratio)
-
-        # Get flattened pixel array
-        flat_pixel_array = np.array(cropped_array).flatten()
-
+        # Get pixel array
+        pixel_array = instance.pixel_array
         is_greyscale = cls._check_if_greyscale(instance)
+
+        # Crop down to just only look at image corners
+        cropped_array = cls._get_array_corners(pixel_array, crop_ratio)
+
         if is_greyscale:
+            # Get flattened pixel array
+            flat_pixel_array = np.array(cropped_array).flatten()
             # Get most common value
             values, counts = np.unique(flat_pixel_array, return_counts=True)
-            flat_pixel_array = np.array(flat_pixel_array)
             common_value = values[np.argmax(counts)]
+            max_value = np.max(values)
         else:
-            raise TypeError(
-                "Most common pixel value retrieval is only supported for greyscale images at this point."  # noqa: E501
-            )
+            # For RGB images, calculate most common value per channel
+            values = []
+            max_values = []
+            
+            # Handle both (height, width, 3) and (3, height, width) formats
+            if len(cropped_array.shape) == 3:
+                if cropped_array.shape[-1] == 3:  # (height, width, 3)
+                    flat_pixel_array = cropped_array.reshape(-1, 3)
+                    for channel in range(3):
+                        channel_values = flat_pixel_array[:, channel]
+                        unique_values, counts = np.unique(channel_values, return_counts=True)
+                        values.append(unique_values[np.argmax(counts)])
+                        max_values.append(np.max(unique_values))
+                elif cropped_array.shape[0] == 3:  # (3, height, width)
+                    for channel in range(3):
+                        channel_values = cropped_array[channel].flatten()
+                        unique_values, counts = np.unique(channel_values, return_counts=True)
+                        values.append(unique_values[np.argmax(counts)])
+                        max_values.append(np.max(unique_values))
+                else:
+                    raise ValueError("Invalid RGB array shape")
+            else:
+                raise ValueError("Expected 3D array for RGB image")
+                
+            common_value = np.array(values)
+            max_value = np.array(max_values)
 
         # Invert color as necessary
         if fill.lower() in ["contrast", "invert", "inverted", "inverse"]:
-            pixel_value = np.max(flat_pixel_array) - common_value
+            pixel_value = max_value - common_value
         elif fill.lower() in ["background", "bg"]:
             pixel_value = common_value
 
@@ -791,15 +851,9 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
         else:
             raise ValueError("fill must be 'contrast' or 'background'")
 
-        # Temporarily save as PNG to get color
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            dst_path = Path(f"{tmpdirname}/temp.dcm")
-            instance.save_as(dst_path)
-            _, is_greyscale = cls._convert_dcm_to_png(dst_path, output_dir=tmpdirname)
-
-            png_filepath = f"{tmpdirname}/{dst_path.stem}.png"
-            loaded_image = Image.open(png_filepath)
-            box_color = cls._get_bg_color(loaded_image, is_greyscale, invert_flag)
+        # Get the box color directly from the pixel array
+        is_greyscale = cls._check_if_greyscale(instance)
+        box_color = cls._get_most_common_pixel_value(instance, 0.75, fill)
 
         return box_color
 
@@ -900,10 +954,7 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
 
         # Select masking box color
         is_greyscale = cls._check_if_greyscale(instance)
-        if is_greyscale:
-            box_color = cls._get_most_common_pixel_value(instance, crop_ratio, fill)
-        else:
-            box_color = cls._set_bbox_color(redacted_instance, fill)
+        box_color = cls._get_most_common_pixel_value(instance, crop_ratio, fill)
 
         # Apply mask
         for i in range(0, len(bounding_boxes_coordinates)):
@@ -912,9 +963,18 @@ class DicomImageRedactorEngine(ImageRedactorEngine):
             left = bbox["left"]
             width = bbox["width"]
             height = bbox["height"]
-            redacted_instance.pixel_array[top : top + height, left : left + width] = (
-                box_color
-            )
+            if is_greyscale:
+                redacted_instance.pixel_array[top : top + height, left : left + width] = box_color
+            else:
+                # Handle both (height, width, 3) and (3, height, width) formats
+                if redacted_instance.pixel_array.shape[-1] == 3:  # (height, width, 3)
+                    # Broadcast box_color to the right shape for (height, width, 3)
+                    box_color_reshaped = np.broadcast_to(box_color, (height, width, 3))
+                    redacted_instance.pixel_array[top : top + height, left : left + width] = box_color_reshaped
+                else:  # (3, height, width)
+                    # Broadcast box_color to the right shape for (3, height, width)
+                    box_color_reshaped = np.broadcast_to(box_color.reshape(3, 1, 1), (3, height, width))
+                    redacted_instance.pixel_array[:, top : top + height, left : left + width] = box_color_reshaped
 
         redacted_instance.PixelData = redacted_instance.pixel_array.tobytes()
 
